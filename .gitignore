@@ -1,0 +1,33 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Backup files
+*~
+*.swp
+*.swo
+
+# IDE / editor
+.idea/
+.vscode/
+*.code-workspace
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark & perf artifacts
+/target/perf-results/
+/target/criterion/
+
+# Environment
+.env
+.env.*
+
+# Debug / profiling output
+*.profraw
+*.profdata
+perf.data
+perf.data.old

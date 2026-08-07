@@ -1,0 +1,53 @@
+# Project Overview: High-Throughput Memory Allocator Benchmark Suite in Rust
+
+## Project Goal
+Demonstrate system-level Rust engineering expertise by building a production-grade benchmark suite that measures memory allocation overhead, tail latency (p99/p99.9), and heap fragmentation under heavy concurrent transaction ingestion workloads.
+
+## Technical Scope & Architecture
+We are simulating the network ingestion pipeline of a high-performance blockchain node or low-latency trading system. The system receives thousands of short-lived payloads per second, forcing intensive heap allocation and deallocation across multiple threads.
+
+### Primary Objectives
+1. Implement a concurrent workload generator in Rust simulating high-throughput payload ingestion.
+2. Compare three global allocators using Feature Flags:
+   - System Allocator (`std::alloc::System` / `glibc malloc`)
+   - `jemalloc` (`tikv-jemallocator`)
+   - `mimalloc` (`mimalloc`)
+3. Measure latency metrics accurately using high-resolution histograms (`hdrhistogram`).
+4. Micro-benchmark execution time using `criterion`.
+5. Provide a standalone executable and shell script to capture OS-level hardware counters via `perf stat` (Cache misses, Page faults, Context switches).
+
+## Implementation Requirements
+- **Language & Edition:** Rust 2021 Edition.
+- **Dependencies:** `criterion`, `tikv-jemallocator`, `mimalloc`, `hdrhistogram`, `rayon`, `clap`, `crossbeam-channel`.
+- **Zero-Copy & Safety:** Clean, safe Rust. Minimize unsafe blocks unless strictly required for global allocator binding.
+- **Profiling Readiness:** Code must be compiled with release optimizations (`opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `debug = true` for symbols).
+
+## Deliverables to Generate
+1. `Cargo.toml` with feature flags (`use-jemalloc`, `use-mimalloc`, `use-system`).
+2. `src/main.rs`: CLI entrypoint to run latency tests over customizable thread counts and allocation sizes.
+3. `src/workload.rs`: Allocation/deallocation routines simulating JSON/Borsh network packet parsing.
+4. `src/metrics.rs`: Latency recorder capturing p50, p90, p99, and p99.9 latency.
+5. `benches/allocator_latencies.rs`: Criterion benchmark suite.
+6. `scripts/run_benchmarks.sh`: Bash script to execute the binary under Linux `perf stat` and output structured comparison tables.
+
+## Rust Coding Standards
+
+### General Principles
+- **Ownership & Borrowing**: Always prefer idiomatic ownership patterns. Avoid unnecessary `.clone()` or `unsafe` blocks.
+- **Error Handling**: Use `Result` and `Option` properly. Use `thiserror` for library errors and `anyhow` for application logic.
+- **Safety First**: No `unsafe` code unless strictly justified (e.g. global allocator binding). Favor `Option` and `Result` over `.unwrap()`.
+- **TDD**: Write tests in `mod tests` or `tests/` before implementation. Run `cargo test` before suggesting completion.
+
+### Standards
+- Follow `clippy` and `rustfmt` suggestions.
+- Use `Cargo.toml` efficiently (workspace, features).
+- Use `match` and `if let` for pattern matching.
+- Use the "Newtype" pattern for domain-specific types. Keep crates modular.
+- Avoid magic macros or complex type inference that hides logic. Be explicit with types and error handling.
+- Documentation: Use `///` for public functions and `//` for internal logic.
+
+### Function Documentation
+Every function must include a doc comment (`///`) specifying:
+- **Purpose**: What the function does.
+- **Inputs**: Explanation of each parameter.
+- **Returns**: What it yields and potential error cases.

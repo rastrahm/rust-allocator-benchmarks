@@ -1,0 +1,39 @@
+[package]
+name = "allocator-benchmarks"
+version = "0.1.0"
+edition = "2021"
+description = "High-throughput memory allocator benchmark suite"
+license = "MIT"
+
+[features]
+default = ["use-system"]
+use-system = []
+use-jemalloc = ["dep:tikv-jemallocator"]
+use-mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+hdrhistogram = "7.5"
+rayon = "1.10"
+thiserror = "2.0"
+
+tikv-jemallocator = { version = "0.6", optional = true }
+mimalloc = { version = "0.1", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "allocator_latencies"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true
+
+[profile.bench]
+inherits = "release"
