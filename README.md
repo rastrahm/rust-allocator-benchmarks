@@ -1,5 +1,7 @@
 # allocator-benchmarks
 
+> Versión en inglés: [README.en.md](README.en.md)
+
 Suite de benchmarks en Rust para comparar allocators globales de memoria bajo cargas concurrentes de ingesta de red. Simula el pipeline de un nodo blockchain o sistema de trading de baja latencia: miles de payloads de corta duración, alloc/dealloc intensivos y medición de colas largas (p99 / p99.9).
 
 ## Objetivos
