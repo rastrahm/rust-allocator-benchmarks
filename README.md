@@ -25,8 +25,10 @@ Suite de benchmarks en Rust para comparar allocators globales de memoria bajo ca
 ## Requisitos
 
 - Rust 2021 (stable)
-- Linux (para `perf stat`)
+- Linux (para `perf stat` e ingesta io_uring)
 - `perf` — paquete `linux-tools` de tu kernel
+- **GPU (opcional):** driver NVIDIA + GPU CUDA-capable (modos `cuda-kernels` / `cuda-serious`)
+- **io_uring (opcional):** kernel Linux ≥ 5.10 (modo `io-uring`)
 
 ### Instalar perf (Ubuntu / Pop!_OS)
 
@@ -53,7 +55,33 @@ cargo build --release --no-default-features --features use-jemalloc
 
 # mimalloc
 cargo build --release --no-default-features --features use-mimalloc
+
+# Ingesta async TCP (Red C)
+cargo build --release --features ingress-async
+
+# Ingesta io_uring (Red D)
+cargo build --release --features ingress-io-uring
+
+# GPU kernels + VRAM (GPU C)
+cargo build --release --features gpu-cuda
+
+# Benchmark GPU serio multi-kernel (GPU D)
+cargo build --release --features gpu-serious
 ```
+
+### Feature flags
+
+| Feature | Descripción | Dependencias opcionales |
+|---------|-------------|-------------------------|
+| `use-system` (default) | Allocator glibc | — |
+| `use-jemalloc` | Allocator jemalloc | `tikv-jemallocator` |
+| `use-mimalloc` | Allocator mimalloc | `mimalloc` |
+| `ingress-async` | Ingesta TCP async (Tokio) | `tokio` |
+| `ingress-io-uring` | Ingesta production-like io_uring | `tokio-uring` (+ `ingress-async`) |
+| `gpu-cuda` | Acelerador CUDA kernels + VRAM | `cudarc` |
+| `gpu-serious` | Pipeline GPU sostenido multi-kernel | `gpu-cuda` |
+
+> Los modos de ingesta y acelerador se eligen en **runtime** (CLI). Requieren compilar con el feature correspondiente.
 
 El perfil `release` está optimizado para benchmarks y profiling:
 
@@ -74,7 +102,30 @@ cargo run --release -- [OPCIONES]
 | `-f, --format` | `json-like` o `borsh-like` | json-like |
 | `--seed` | Semilla base del contenido | 0 |
 | `--queue-depth` | Capacidad del canal acotado | threads × 4 |
+| `--ingress` | Modo de ingesta: `in-memory`, `async-tcp`, `io-uring` | in-memory |
+| `--ingress-port` | Puerto TCP (modos de red) | 9876 |
+| `--ingress-connections` | Conexiones cliente concurrentes | 4 |
+| `--ingress-read-batch` | Frames leídos por batch TCP | 64 |
+| `--accelerator` | Post-proceso: `none`, `cuda-kernels`, `cuda-serious` | none |
+| `--cuda-device` | Índice del dispositivo CUDA | 0 |
+| `--gpu-batch-size` | Elementos por batch GPU | 256 |
 | `--verbose` | Muestra el allocator activo en stderr | false |
+
+### Modos de ingesta de red
+
+| Modo CLI | Feature | Descripción |
+|----------|---------|-------------|
+| `in-memory` | (default) | Canal crossbeam in-process (comportamiento original) |
+| `async-tcp` | `ingress-async` | Listener TCP local + N clientes Tokio, frames wire binarios |
+| `io-uring` | `ingress-io-uring` | Misma topología TCP vía `tokio-uring` (I/O submission-based) |
+
+### Modos de aceleración GPU
+
+| Modo CLI | Feature | Descripción |
+|----------|---------|-------------|
+| `none` | (default) | Sin trabajo GPU post-parseo |
+| `cuda-kernels` | `gpu-cuda` | 1 kernel CUDA + alloc/liberación VRAM por payload |
+| `cuda-serious` | `gpu-serious` | 3 buffers VRAM persistentes, pipeline 3×3 kernels (mín. batch 64) |
 
 ### Ejemplos
 
@@ -89,19 +140,53 @@ cargo run --release --no-default-features --features use-jemalloc -- \
 # mimalloc
 cargo run --release --no-default-features --features use-mimalloc -- \
   -n 20000 -t 24 -s 2048
+
+# Ingesta async TCP (requiere --features ingress-async)
+cargo run --release --features ingress-async -- \
+  --ingress async-tcp --ingress-port 9876 --ingress-connections 4 \
+  -n 10000 -t 24 -s 2048
+
+# Ingesta io_uring (requiere --features ingress-io-uring)
+cargo run --release --features ingress-io-uring -- \
+  --ingress io-uring --ingress-port 9877 --ingress-connections 4 \
+  -n 10000 -t 24 -s 2048
+
+# GPU kernels + VRAM (requiere --features gpu-cuda y GPU NVIDIA)
+cargo run --release --features gpu-cuda -- \
+  --accelerator cuda-kernels --gpu-batch-size 256 \
+  -n 5000 -t 8 -s 512
+
+# Benchmark GPU serio (requiere --features gpu-serious)
+cargo run --release --features gpu-serious -- \
+  --accelerator cuda-serious --gpu-batch-size 128 \
+  -n 5000 -t 8 -s 512
+```
+
+Combinaciones posibles (ejemplo: red realista + GPU):
+
+```bash
+cargo run --release --features ingress-async,gpu-cuda -- \
+  --ingress async-tcp --accelerator cuda-kernels \
+  -n 10000 -t 24 -s 2048
 ```
 
 ### Salida
 
-El binario imprime throughput, percentiles de latencia (p50, p90, p99, p99.9) y estadísticas básicas (min, max, mean).
+El binario imprime allocator, modo de ingesta, acelerador, throughput, percentiles de latencia (p50, p90, p99, p99.9) y estadísticas básicas (min, max, mean).
 
 ## Arquitectura
 
 ```
-┌─────────────┐     bounded channel     ┌──────────────┐
-│  Productor  │ ──────────────────────► │   Workers    │
-│  (1 hilo)   │   crossbeam-channel     │  (N hilos)   │
-└─────────────┘                         └──────┬───────┘
+                    ┌─────────────────────────────────────────┐
+                    │           Ingress (configurable)         │
+                    │  in-memory │ async-tcp │ io-uring        │
+                    └────────────────────┬────────────────────┘
+                                         │ bounded channel
+                                         ▼
+┌─────────────┐     crossbeam-channel     ┌──────────────┐     ┌─────────────────┐
+│  Productor  │ ──────────────────────► │   Workers    │ ──► │  Accelerator    │
+│             │                         │  (N hilos)   │     │ none / cuda-*   │
+└─────────────┘                         └──────┬───────┘     └─────────────────┘
                                                │
                                                ▼
                                       ┌────────────────┐
@@ -115,6 +200,8 @@ El binario imprime throughput, percentiles de latencia (p50, p90, p99, p99.9) y 
 | `src/workload.rs` | Simula parsing JSON/Borsh con alloc/dealloc intensivos |
 | `src/metrics.rs` | Registro thread-safe de latencias y cálculo de percentiles |
 | `src/runner.rs` | Pipeline productor/consumidor y orquestación del benchmark |
+| `src/ingress/` | Fuentes de ingesta: in-memory, async TCP, io_uring |
+| `src/accelerator/` | Hooks post-proceso: no-op, CUDA kernels, pipeline serio |
 | `src/main.rs` | CLI y binding del allocator global |
 | `benches/` | Micro-benchmarks Criterion |
 
@@ -123,9 +210,24 @@ El binario imprime throughput, percentiles de latencia (p50, p90, p99, p99.9) y 
 ```bash
 cargo test
 cargo clippy -- -D warnings
+
+# Con extensiones de red y GPU
+cargo test --features ingress-io-uring
+cargo test --features gpu-serious
+cargo clippy --features gpu-serious -- -D warnings
 ```
 
-Incluye tests unitarios (`metrics`, `workload`, `runner`) e integración end-to-end en `tests/benchmark_integration.rs`.
+Incluye tests unitarios (`metrics`, `workload`, `runner`, `ingress`, `accelerator`) e integración end-to-end:
+
+| Test | Feature requerido |
+|------|-------------------|
+| `tests/benchmark_integration.rs` | (default) |
+| `tests/async_tcp_integration.rs` | `ingress-async` |
+| `tests/io_uring_integration.rs` | `ingress-io-uring` |
+| `tests/cuda_integration.rs` | `gpu-cuda` |
+| `tests/cuda_serious_integration.rs` | `gpu-serious` |
+
+Los tests CUDA se omiten automáticamente si no hay GPU disponible.
 
 ## Micro-benchmarks (Criterion)
 
@@ -199,6 +301,9 @@ Salida en `target/perf-results/long_<timestamp>/`.
 | `clap` | CLI |
 | `criterion` | Micro-benchmarks estadísticos (dev) |
 | `tikv-jemallocator` / `mimalloc` | Allocators globales alternativos (opcionales) |
+| `tokio` | Ingesta async TCP (opcional) |
+| `tokio-uring` | Ingesta io_uring (opcional) |
+| `cudarc` | Kernels CUDA y alloc VRAM (opcional) |
 
 ## Interpretación rápida de métricas
 
