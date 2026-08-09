@@ -1,3 +1,5 @@
+use allocator_benchmarks::accelerator::{AcceleratorConfig, AcceleratorMode};
+use allocator_benchmarks::ingress::{IngressConfig, IngressMode};
 use allocator_benchmarks::runner::{run_benchmark, BenchmarkConfig};
 use allocator_benchmarks::workload::PacketFormat;
 use clap::Parser;
@@ -39,6 +41,34 @@ struct Cli {
     #[arg(long = "queue-depth")]
     queue_depth: Option<usize>,
 
+    /// Modo de ingesta de red.
+    #[arg(long = "ingress", value_enum, default_value_t = IngressMode::InMemory)]
+    ingress: IngressMode,
+
+    /// Puerto TCP para modos async-tcp / io-uring.
+    #[arg(long = "ingress-port", default_value_t = 9_876)]
+    ingress_port: u16,
+
+    /// Conexiones cliente concurrentes (modos de red).
+    #[arg(long = "ingress-connections", default_value_t = 4)]
+    ingress_connections: usize,
+
+    /// Tamaño de batch de lectura por conexión.
+    #[arg(long = "ingress-read-batch", default_value_t = 64)]
+    ingress_read_batch: usize,
+
+    /// Modo de aceleración GPU post-procesamiento.
+    #[arg(long = "accelerator", value_enum, default_value_t = AcceleratorMode::None)]
+    accelerator: AcceleratorMode,
+
+    /// Índice de dispositivo CUDA.
+    #[arg(long = "cuda-device", default_value_t = 0)]
+    cuda_device: u32,
+
+    /// Tamaño de batch para kernels GPU.
+    #[arg(long = "gpu-batch-size", default_value_t = 256)]
+    gpu_batch_size: usize,
+
     /// Muestra el allocator activo en stderr.
     #[arg(long, default_value_t = false)]
     verbose: bool,
@@ -76,6 +106,17 @@ fn build_config(cli: &Cli) -> anyhow::Result<BenchmarkConfig> {
         format: cli.format,
         seed: cli.seed,
         queue_depth,
+        ingress: IngressConfig {
+            mode: cli.ingress,
+            bind_port: cli.ingress_port,
+            connections: cli.ingress_connections,
+            read_batch_size: cli.ingress_read_batch,
+        },
+        accelerator: AcceleratorConfig {
+            mode: cli.accelerator,
+            cuda_device: cli.cuda_device,
+            gpu_batch_size: cli.gpu_batch_size,
+        },
     })
 }
 

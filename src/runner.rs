@@ -1,12 +1,15 @@
 //! Orquestación del benchmark concurrente: productor, workers y agregación de métricas.
 
 use crate::metrics::{LatencyRecorder, LatencySnapshot, MetricsError};
-use crate::workload::{process_and_record, PacketFormat, WorkloadConfig, WorkloadError};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crate::workload::{PacketFormat, WorkloadConfig, WorkloadError};
+use crossbeam_channel::Receiver;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+use crate::accelerator::{build_accelerator, process_record_with_accelerator, AcceleratorConfig};
+use crate::ingress::{join_ingress_producer, spawn_ingress_producer, IngressConfig};
 
 /// Configuración de una ejecución del benchmark.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +26,10 @@ pub struct BenchmarkConfig {
     pub seed: u64,
     /// Capacidad del canal acotado (backpressure productor/consumidor).
     pub queue_depth: usize,
+    /// Configuración del modo de ingesta.
+    pub ingress: IngressConfig,
+    /// Configuración del acelerador post-procesamiento.
+    pub accelerator: AcceleratorConfig,
 }
 
 impl Default for BenchmarkConfig {
@@ -38,6 +45,8 @@ impl Default for BenchmarkConfig {
             format: PacketFormat::JsonLike,
             seed: 0,
             queue_depth: threads * 4,
+            ingress: IngressConfig::default(),
+            accelerator: AcceleratorConfig::default(),
         }
     }
 }
@@ -84,30 +93,7 @@ pub enum BenchmarkError {
 /// [`BenchmarkResult`] con percentiles y throughput, o un error de configuración/ejecución.
 pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkResult, BenchmarkError> {
     validate_config(config)?;
-
-    let (job_tx, job_rx) = bounded::<WorkloadConfig>(config.queue_depth);
-    let recorder = Arc::new(LatencyRecorder::new()?);
-
-    let started = Instant::now();
-    let producer = spawn_producer(job_tx, config);
-    let workers = spawn_workers(config.threads, Arc::clone(&recorder), job_rx);
-
-    producer.join().map_err(|_| BenchmarkError::WorkerPanicked)??;
-    join_workers(workers)?;
-
-    let elapsed = started.elapsed();
-    let snapshot = recorder.snapshot();
-    let throughput_per_sec = if elapsed.is_zero() {
-        0.0
-    } else {
-        config.iterations as f64 / elapsed.as_secs_f64()
-    };
-
-    Ok(BenchmarkResult {
-        snapshot,
-        elapsed,
-        throughput_per_sec,
-    })
+    run_pipeline(config)
 }
 
 /// Valida parámetros de ejecución antes de lanzar hilos.
@@ -129,27 +115,50 @@ fn validate_config(config: &BenchmarkConfig) -> Result<(), BenchmarkError> {
     }
 
     WorkloadConfig::new(config.payload_bytes, config.format, config.seed)?;
+    config.ingress.validate()?;
+    config.accelerator.validate()?;
     Ok(())
 }
 
-/// Hilo productor: encola configs de workload con semilla por iteración.
-fn spawn_producer(
-    job_tx: Sender<WorkloadConfig>,
-    config: &BenchmarkConfig,
-) -> thread::JoinHandle<Result<(), BenchmarkError>> {
-    let payload_bytes = config.payload_bytes;
-    let format = config.format;
-    let seed = config.seed;
-    let iterations = config.iterations;
+/// Ejecuta el pipeline de benchmark con ingesta y acelerador configurables.
+fn run_pipeline(config: &BenchmarkConfig) -> Result<BenchmarkResult, BenchmarkError> {
+    use crossbeam_channel::bounded;
 
-    thread::spawn(move || {
-        for iteration in 0..iterations {
-            let workload = WorkloadConfig::new(payload_bytes, format, seed.wrapping_add(iteration))?;
-            job_tx
-                .send(workload)
-                .map_err(|_| BenchmarkError::InvalidConfig("job channel closed".into()))?;
-        }
-        Ok(())
+    let (job_tx, job_rx) = bounded(config.queue_depth);
+    let recorder = Arc::new(LatencyRecorder::new()?);
+    let accelerator = build_accelerator(&config.accelerator)?;
+
+    let started = Instant::now();
+    let producer = spawn_ingress_producer(
+        &config.ingress,
+        config.iterations,
+        config.payload_bytes,
+        config.format,
+        config.seed,
+        job_tx,
+    )?;
+    let workers = spawn_workers(
+        config.threads,
+        Arc::clone(&recorder),
+        job_rx,
+        Arc::clone(&accelerator),
+    );
+
+    join_ingress_producer(producer)?;
+    join_workers(workers)?;
+
+    let elapsed = started.elapsed();
+    let snapshot = recorder.snapshot();
+    let throughput_per_sec = if elapsed.is_zero() {
+        0.0
+    } else {
+        config.iterations as f64 / elapsed.as_secs_f64()
+    };
+
+    Ok(BenchmarkResult {
+        snapshot,
+        elapsed,
+        throughput_per_sec,
     })
 }
 
@@ -158,16 +167,18 @@ fn spawn_workers(
     thread_count: usize,
     recorder: Arc<LatencyRecorder>,
     job_rx: Receiver<WorkloadConfig>,
-) -> Vec<thread::JoinHandle<Result<(), WorkloadError>>> {
+    accelerator: Arc<dyn crate::accelerator::AcceleratorHook + Send + Sync>,
+) -> Vec<thread::JoinHandle<Result<(), BenchmarkError>>> {
     (0..thread_count)
         .map(|_| {
             let recorder = Arc::clone(&recorder);
             let job_rx = job_rx.clone();
+            let accelerator = Arc::clone(&accelerator);
 
             thread::spawn(move || {
                 let mut writer = recorder.recorder();
                 for job in job_rx.iter() {
-                    process_and_record(&job, &mut writer)?;
+                    process_record_with_accelerator(&job, &mut writer, accelerator.as_ref())?;
                 }
                 Ok(())
             })
@@ -176,7 +187,7 @@ fn spawn_workers(
 }
 
 fn join_workers(
-    workers: Vec<thread::JoinHandle<Result<(), WorkloadError>>>,
+    workers: Vec<thread::JoinHandle<Result<(), BenchmarkError>>>,
 ) -> Result<(), BenchmarkError> {
     for worker in workers {
         worker
@@ -212,6 +223,8 @@ pub fn print_results(
     println!("Iterations:    {}", config.iterations);
     println!("Payload size:  {} bytes", config.payload_bytes);
     println!("Format:        {:?}", config.format);
+    println!("Ingress:       {:?}", config.ingress.mode);
+    println!("Accelerator:   {:?}", config.accelerator.mode);
     println!("Queue depth:   {}", config.queue_depth);
     println!("Elapsed:       {:.3} s", result.elapsed.as_secs_f64());
     println!(
