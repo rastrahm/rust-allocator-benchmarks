@@ -5,6 +5,8 @@
 # Uso:
 #   ./scripts/run_benchmarks.sh
 #   ./scripts/run_benchmarks.sh -- -n 50000 -t 4 -s 2048
+#   ./scripts/run_benchmarks.sh --profile network-async -- -n 10000 -t 24
+#   ./scripts/run_benchmarks.sh --ingress async-tcp --accelerator cuda-kernels
 #
 # Requisitos: Linux, perf (linux-tools), cargo, permisos para perf_event_open
 #   sudo sysctl kernel.perf_event_paranoid=1   # o -1 para acceso completo
@@ -19,8 +21,17 @@ RESULTS_DIR="$ROOT/target/perf-results"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 SUMMARY_FILE="$RESULTS_DIR/comparison_${TIMESTAMP}.txt"
 
-# Argumentos pasados al binario (después de `--`)
+# Argumentos base pasados al binario (después de `--`); el script añade flags de modo.
 BENCH_ARGS=(-n 20000 -t 4 -s 2048 --verbose)
+
+# Modos de ingesta y acelerador (defaults = comportamiento original)
+INGRESS_MODE="${INGRESS_MODE:-in-memory}"
+ACCELERATOR_MODE="${ACCELERATOR_MODE:-none}"
+INGRESS_PORT="${INGRESS_PORT:-9876}"
+INGRESS_CONNECTIONS="${INGRESS_CONNECTIONS:-4}"
+INGRESS_READ_BATCH="${INGRESS_READ_BATCH:-64}"
+CUDA_DEVICE="${CUDA_DEVICE:-0}"
+GPU_BATCH_SIZE="${GPU_BATCH_SIZE:-256}"
 
 PERF_EVENTS=(
     "cycles"
@@ -43,12 +54,31 @@ usage() {
 Uso: run_benchmarks.sh [opciones] [-- args-del-binario]
 
 Opciones:
-  -h, --help     Muestra esta ayuda
-  --no-build     Omite cargo build (usa binarios existentes)
-  --runs N       Repeticiones de perf stat por allocator (default: 1)
+  -h, --help              Muestra esta ayuda
+  --no-build              Omite cargo build (usa binarios existentes)
+  --runs N                Repeticiones de perf stat por allocator (default: 1)
+  --profile NAME          Perfil predefinido de ingesta/acelerador (ver abajo)
+  --ingress MODE          in-memory | async-tcp | io-uring (default: in-memory)
+  --accelerator MODE      none | cuda-kernels | cuda-serious (default: none)
+  --ingress-port N        Puerto TCP para modos de red (default: 9876)
+  --ingress-connections N Conexiones cliente TCP (default: 4)
+  --ingress-read-batch N  Frames por batch de lectura (default: 64)
+  --cuda-device N         Índice GPU CUDA (default: 0)
+  --gpu-batch-size N      Tamaño batch GPU (default: 256)
 
-Ejemplo:
+Perfiles (--profile):
+  baseline          in-memory + none (original)
+  network-async     async-tcp + none        (feature: ingress-async)
+  network-io-uring  io-uring + none           (feature: ingress-io-uring)
+  gpu-kernels       in-memory + cuda-kernels  (feature: gpu-cuda)
+  gpu-serious       in-memory + cuda-serious  (feature: gpu-serious)
+  network-gpu       async-tcp + cuda-kernels  (ingress-async + gpu-cuda)
+
+Ejemplos:
   ./scripts/run_benchmarks.sh -- -n 50000 -t 8 -s 4096 -f borsh-like
+  ./scripts/run_benchmarks.sh --profile network-async -- -n 10000 -t 24 -s 2048
+  ./scripts/run_benchmarks.sh --ingress io-uring --accelerator cuda-serious \
+      --gpu-batch-size 128 -- -n 5000 -t 8
 EOF
 }
 
@@ -59,8 +89,114 @@ require_command() {
     fi
 }
 
+cuda_available() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
+}
+
+apply_profile() {
+    local profile="$1"
+    case "$profile" in
+        baseline)
+            INGRESS_MODE=in-memory
+            ACCELERATOR_MODE=none
+            ;;
+        network-async)
+            INGRESS_MODE=async-tcp
+            ACCELERATOR_MODE=none
+            ;;
+        network-io-uring)
+            INGRESS_MODE=io-uring
+            ACCELERATOR_MODE=none
+            ;;
+        gpu-kernels)
+            INGRESS_MODE=in-memory
+            ACCELERATOR_MODE=cuda-kernels
+            ;;
+        gpu-serious)
+            INGRESS_MODE=in-memory
+            ACCELERATOR_MODE=cuda-serious
+            GPU_BATCH_SIZE="${GPU_BATCH_SIZE:-128}"
+            ;;
+        network-gpu)
+            INGRESS_MODE=async-tcp
+            ACCELERATOR_MODE=cuda-kernels
+            ;;
+        *)
+            echo "error: perfil desconocido: $profile" >&2
+            echo "Perfiles válidos: baseline, network-async, network-io-uring," >&2
+            echo "  gpu-kernels, gpu-serious, network-gpu" >&2
+            exit 1
+            ;;
+    esac
+}
+
+extra_cargo_features() {
+    local extras=()
+    case "$INGRESS_MODE" in
+        async-tcp) extras+=("ingress-async") ;;
+        io-uring) extras+=("ingress-io-uring") ;;
+        in-memory) ;;
+        *)
+            echo "error: --ingress inválido: $INGRESS_MODE" >&2
+            exit 1
+            ;;
+    esac
+    case "$ACCELERATOR_MODE" in
+        cuda-kernels) extras+=("gpu-cuda") ;;
+        cuda-serious) extras+=("gpu-serious") ;;
+        none) ;;
+        *)
+            echo "error: --accelerator inválido: $ACCELERATOR_MODE" >&2
+            exit 1
+            ;;
+    esac
+    if ((${#extras[@]} > 0)); then
+        local IFS=,
+        echo "${extras[*]}"
+    fi
+}
+
+validate_runtime_modes() {
+    case "$INGRESS_MODE" in
+        in-memory | async-tcp | io-uring) ;;
+        *)
+            echo "error: ingress mode inválido: $INGRESS_MODE" >&2
+            exit 1
+            ;;
+    esac
+    case "$ACCELERATOR_MODE" in
+        none | cuda-kernels | cuda-serious) ;;
+        *)
+            echo "error: accelerator mode inválido: $ACCELERATOR_MODE" >&2
+            exit 1
+            ;;
+    esac
+
+    if [[ "$ACCELERATOR_MODE" != "none" ]] && ! cuda_available; then
+        echo "error: modo GPU '$ACCELERATOR_MODE' requiere NVIDIA GPU (nvidia-smi)" >&2
+        exit 1
+    fi
+
+    if [[ "$ACCELERATOR_MODE" == "cuda-serious" ]] && [[ "$GPU_BATCH_SIZE" -lt 64 ]]; then
+        echo "nota: cuda-serious requiere gpu-batch-size >= 64; usando 128" >&2
+        GPU_BATCH_SIZE=128
+    fi
+}
+
+mode_cli_args() {
+    local args=(
+        --ingress "$INGRESS_MODE"
+        --ingress-port "$INGRESS_PORT"
+        --ingress-connections "$INGRESS_CONNECTIONS"
+        --ingress-read-batch "$INGRESS_READ_BATCH"
+        --accelerator "$ACCELERATOR_MODE"
+        --cuda-device "$CUDA_DEVICE"
+        --gpu-batch-size "$GPU_BATCH_SIZE"
+    )
+    printf '%s\n' "${args[@]}"
+}
+
 resolve_perf() {
-    # Permite override manual: PERF=/ruta/a/perf ./scripts/run_benchmarks.sh
     if [[ -n "${PERF:-}" ]]; then
         if "$PERF" stat true >/dev/null 2>&1; then
             echo "$PERF"
@@ -70,13 +206,11 @@ resolve_perf() {
         exit 1
     fi
 
-    # Wrapper de /usr/bin/perf (falla en Pop!_OS si no hay tools para el kernel exacto)
     if command -v perf >/dev/null 2>&1 && perf stat true >/dev/null 2>&1; then
         command -v perf
         return 0
     fi
 
-    # Fallback: binario versionado (sigue symlinks de linux-tools → linux-hwe-*-tools)
     local candidate
     candidate="$(find -L /usr/lib/linux-tools -maxdepth 2 -name perf -type f 2>/dev/null | sort -V | tail -1)"
     if [[ -z "$candidate" ]]; then
@@ -95,9 +229,7 @@ Pop!_OS / kernel $(uname -r): el wrapper /usr/bin/perf busca
   /usr/lib/linux-tools/$(uname -r)/perf
 pero ese paquete no existe en apt. Solución rápida:
 
-  sudo mkdir -p /usr/lib/linux-tools/$(uname -r)
-  sudo ln -sf /usr/lib/linux-tools/6.17.0-42-generic/perf \\
-       /usr/lib/linux-tools/$(uname -r)/perf
+  sudo ./scripts/fix-perf-wrapper.sh
 
 O usa el binario directamente:
   PERF=/usr/lib/linux-tools/6.17.0-42-generic/perf ./scripts/run_benchmarks.sh
@@ -109,12 +241,13 @@ EOF
 }
 
 check_perf() {
-    : # resuelto en resolve_perf
+    :
 }
 
 DO_BUILD=1
 PERF_RUNS=1
 COOLDOWN_ALLOC="${COOLDOWN_ALLOC:-0}"
+PROFILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -128,6 +261,39 @@ while [[ $# -gt 0 ]]; do
             ;;
         --runs)
             PERF_RUNS="${2:?--runs requiere un número}"
+            shift 2
+            ;;
+        --profile)
+            PROFILE="${2:?--profile requiere un nombre}"
+            apply_profile "$PROFILE"
+            shift 2
+            ;;
+        --ingress)
+            INGRESS_MODE="${2:?--ingress requiere un modo}"
+            shift 2
+            ;;
+        --accelerator)
+            ACCELERATOR_MODE="${2:?--accelerator requiere un modo}"
+            shift 2
+            ;;
+        --ingress-port)
+            INGRESS_PORT="${2:?--ingress-port requiere un número}"
+            shift 2
+            ;;
+        --ingress-connections)
+            INGRESS_CONNECTIONS="${2:?--ingress-connections requiere un número}"
+            shift 2
+            ;;
+        --ingress-read-batch)
+            INGRESS_READ_BATCH="${2:?--ingress-read-batch requiere un número}"
+            shift 2
+            ;;
+        --cuda-device)
+            CUDA_DEVICE="${2:?--cuda-device requiere un número}"
+            shift 2
+            ;;
+        --gpu-batch-size)
+            GPU_BATCH_SIZE="${2:?--gpu-batch-size requiere un número}"
             shift 2
             ;;
         --)
@@ -146,6 +312,13 @@ done
 require_command cargo
 PERF_BIN="$(resolve_perf)"
 check_perf
+validate_runtime_modes
+
+EXTRA_CARGO_FEATURES="$(extra_cargo_features)"
+FULL_BENCH_ARGS=("${BENCH_ARGS[@]}")
+while IFS= read -r flag; do
+    FULL_BENCH_ARGS+=("$flag")
+done < <(mode_cli_args)
 
 mkdir -p "$RESULTS_DIR"
 
@@ -155,8 +328,12 @@ declare -A LATENCY_P50 LATENCY_P99 LATENCY_P999 LATENCY_THROUGHPUT LATENCY_ELAPS
 build_feature() {
     local feature="$1"
     local label="$2"
-    echo "==> Compilando release con feature: $feature ($label)"
-    cargo build --release --no-default-features --features "$feature"
+    local features="$feature"
+    if [[ -n "$EXTRA_CARGO_FEATURES" ]]; then
+        features="${feature},${EXTRA_CARGO_FEATURES}"
+    fi
+    echo "==> Compilando release: allocator=$feature extras=[$EXTRA_CARGO_FEATURES] ($label)"
+    cargo build --release --no-default-features --features "$features"
 }
 
 run_perf_for_feature() {
@@ -169,11 +346,10 @@ run_perf_for_feature() {
 
     echo "==> perf stat ($label) run $run_id → $log_file [$(basename "$PERF_BIN")]"
 
-    # perf escribe métricas en stderr; el binario imprime resultados en stdout.
     "$PERF_BIN" stat \
         -e "$events_csv" \
         -o "$log_file.raw" \
-        -- "$BINARY" "${BENCH_ARGS[@]}" \
+        -- "$BINARY" "${FULL_BENCH_ARGS[@]}" \
         | tee "$log_file.stdout"
 
     parse_perf_raw "$log_file.raw" "$label" "$run_id"
@@ -206,21 +382,19 @@ parse_perf_raw() {
     local run_id="$3"
 
     while IFS= read -r line; do
-        # Ignorar líneas sin conteo o comentarios
         if [[ "$line" == *"<not counted>"* ]] || [[ "$line" =~ ^[[:space:]]*# ]]; then
             continue
         fi
 
-        # Formato: "     1,234,567  cache-misses" o "     1,234,567  cpu_atom/cycles/u"
         if [[ "$line" =~ ^[[:space:]]*([0-9,]+)[[:space:]]+([^[:space:]]+) ]]; then
             local value="${BASH_REMATCH[1]//,/}"
             local raw_event="${BASH_REMATCH[2]}"
             local event="$raw_event"
             if [[ "$event" == */* ]]; then
-                event="${event#*/}"   # cpu_atom/cycles/u → cycles/u
-                event="${event%%/*}"  # cycles/u → cycles
+                event="${event#*/}"
+                event="${event%%/*}"
             fi
-            event="${event%%:*}"       # page-faults:u → page-faults
+            event="${event%%:*}"
 
             local key="${label}|${event}|${run_id}"
             METRIC_VALUES["$key"]="$value"
@@ -261,7 +435,6 @@ latency_average() {
     for ((run = 1; run <= PERF_RUNS; run++)); do
         local key="${label}|${run}"
         if [[ -n "${values[$key]:-}" ]]; then
-            # Valores como "4.72 µs" o "725484" — extraer número
             local num="${values[$key]%% *}"
             num="${num//,/.}"
             sum="$(awk "BEGIN { print $sum + $num }")"
@@ -281,7 +454,11 @@ print_comparison_table() {
         echo "Allocator Benchmark — perf stat comparison"
         echo "Generated: $(date -Iseconds)"
         echo "Binary:    $BINARY"
-        echo "Args:      ${BENCH_ARGS[*]}"
+        echo "Profile:   ${PROFILE:-custom}"
+        echo "Ingress:   $INGRESS_MODE (port=$INGRESS_PORT conn=$INGRESS_CONNECTIONS batch=$INGRESS_READ_BATCH)"
+        echo "Accelerator: $ACCELERATOR_MODE (device=$CUDA_DEVICE gpu-batch=$GPU_BATCH_SIZE)"
+        echo "Cargo extras: ${EXTRA_CARGO_FEATURES:-none}"
+        echo "Args:      ${FULL_BENCH_ARGS[*]}"
         echo "Runs:      $PERF_RUNS per allocator"
         echo
         printf "%-14s" "Metric"
@@ -343,6 +520,7 @@ print_comparison_table() {
 
 echo "=== Allocator Benchmark Suite — perf stat ==="
 echo "Project: $ROOT"
+echo "Ingress: $INGRESS_MODE | Accelerator: $ACCELERATOR_MODE"
 echo
 
 for entry in "${FEATURES[@]}"; do
