@@ -2,6 +2,15 @@
 
 mod none;
 
+#[cfg(feature = "gpu-cuda")]
+mod cuda_common;
+
+#[cfg(feature = "gpu-cuda")]
+mod cuda_kernels;
+
+#[cfg(feature = "gpu-serious")]
+mod cuda_serious;
+
 use crate::runner::BenchmarkError;
 use crate::workload::WorkloadConfig;
 use hdrhistogram::sync::Recorder;
@@ -9,6 +18,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use none::NoAccelerator;
+#[cfg(feature = "gpu-cuda")]
+pub use cuda_common::cuda_device_available;
+#[cfg(feature = "gpu-cuda")]
+pub use cuda_kernels::CudaKernelAccelerator;
+#[cfg(feature = "gpu-serious")]
+pub use cuda_serious::CudaSeriousAccelerator;
 
 /// Modo de aceleración GPU seleccionado en runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -120,10 +135,7 @@ pub fn build_accelerator(
         AcceleratorMode::CudaKernels => {
             #[cfg(feature = "gpu-cuda")]
             {
-                let _ = config;
-                Err(BenchmarkError::InvalidConfig(
-                    "cuda-kernels accelerator not implemented yet (Step 4)".into(),
-                ))
+                Ok(Arc::new(CudaKernelAccelerator::new(config)?))
             }
             #[cfg(not(feature = "gpu-cuda"))]
             {
@@ -133,10 +145,7 @@ pub fn build_accelerator(
         AcceleratorMode::CudaSerious => {
             #[cfg(feature = "gpu-serious")]
             {
-                let _ = config;
-                Err(BenchmarkError::InvalidConfig(
-                    "cuda-serious accelerator not implemented yet (Step 5)".into(),
-                ))
+                Ok(Arc::new(CudaSeriousAccelerator::new(config)?))
             }
             #[cfg(not(feature = "gpu-serious"))]
             {
@@ -183,10 +192,22 @@ mod tests {
         assert_eq!(AcceleratorConfig::default().mode, AcceleratorMode::None);
     }
 
+    #[cfg(not(feature = "gpu-cuda"))]
     #[test]
     fn cuda_kernels_without_feature_is_rejected() {
         let config = AcceleratorConfig {
             mode: AcceleratorMode::CudaKernels,
+            ..AcceleratorConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, BenchmarkError::InvalidConfig(_)));
+    }
+
+    #[cfg(not(feature = "gpu-serious"))]
+    #[test]
+    fn cuda_serious_without_feature_is_rejected() {
+        let config = AcceleratorConfig {
+            mode: AcceleratorMode::CudaSerious,
             ..AcceleratorConfig::default()
         };
         let err = config.validate().unwrap_err();
