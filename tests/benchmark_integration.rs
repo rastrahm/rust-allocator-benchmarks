@@ -10,6 +10,7 @@ fn end_to_end_benchmark_matches_iteration_count() {
         format: PacketFormat::BorshLike,
         seed: 99,
         queue_depth: 16,
+        ..BenchmarkConfig::default()
     };
 
     let result = run_benchmark(&config).expect("integration benchmark should succeed");
@@ -26,6 +27,7 @@ fn concurrent_json_workload_produces_ordered_percentiles() {
         format: PacketFormat::JsonLike,
         seed: 1,
         queue_depth: 32,
+        ..BenchmarkConfig::default()
     };
 
     let result = run_benchmark(&config).expect("integration benchmark should succeed");

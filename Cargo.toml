@@ -10,6 +10,14 @@ default = ["use-system"]
 use-system = []
 use-jemalloc = ["dep:tikv-jemallocator"]
 use-mimalloc = ["dep:mimalloc"]
+# Red C — async TCP multi-conexión (Paso 2)
+ingress-async = ["dep:tokio"]
+# Red D — io_uring production-like (Paso 3)
+ingress-io-uring = ["ingress-async", "dep:tokio-uring"]
+# GPU C — kernels CUDA + VRAM (Paso 4)
+gpu-cuda = ["dep:cudarc"]
+# GPU D — benchmark serio GPU (Paso 5)
+gpu-serious = ["gpu-cuda"]
 
 [dependencies]
 anyhow = "1.0"
@@ -18,9 +26,12 @@ crossbeam-channel = "0.5"
 hdrhistogram = "7.5"
 rayon = "1.10"
 thiserror = "2.0"
+tokio = { version = "1.43", features = ["net", "rt-multi-thread", "sync", "macros", "io-util", "time"], optional = true }
+tokio-uring = { version = "0.5", optional = true }
 
 tikv-jemallocator = { version = "0.6", optional = true }
 mimalloc = { version = "0.1", optional = true }
+cudarc = { version = "0.13", optional = true, features = ["driver", "cuda-12080"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -1,0 +1,117 @@
+//
+// Precompiled PTX for cuda-serious pipeline (GPU D).
+//
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry serious_mix(
+    .param .u64 serious_mix_param_0,
+    .param .u64 serious_mix_param_1,
+    .param .u32 serious_mix_param_2,
+    .param .u32 serious_mix_param_3
+)
+{
+    .reg .pred      %p<2>;
+    .reg .b32       %r<11>;
+    .reg .b64       %rd<8>;
+
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mov.u32         %r3, %tid.x;
+    mad.lo.s32      %r4, %r1, %r2, %r3;
+
+    ld.param.u32    %r5, [serious_mix_param_2];
+    setp.ge.s32     %p1, %r4, %r5;
+    @%p1 bra        $L__MIX_EXIT;
+
+    ld.param.u64    %rd1, [serious_mix_param_0];
+    ld.param.u64    %rd2, [serious_mix_param_1];
+    ld.param.u32    %r10, [serious_mix_param_3];
+
+    mul.wide.s32    %rd3, %r4, 4;
+    add.s64         %rd4, %rd1, %rd3;
+    ld.global.u32   %r6, [%rd4];
+
+    xor.b32         %r7, %r6, 0xDEADBEEF;
+    xor.b32         %r8, %r7, %r4;
+    xor.b32         %r9, %r8, %r10;
+
+    add.s64         %rd5, %rd2, %rd3;
+    st.global.u32   [%rd5], %r9;
+
+$L__MIX_EXIT:
+    ret;
+}
+
+.visible .entry serious_scramble(
+    .param .u64 serious_scramble_param_0,
+    .param .u64 serious_scramble_param_1,
+    .param .u32 serious_scramble_param_2
+)
+{
+    .reg .pred      %p<2>;
+    .reg .b32       %r<10>;
+    .reg .b64       %rd<8>;
+
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mov.u32         %r3, %tid.x;
+    mad.lo.s32      %r4, %r1, %r2, %r3;
+
+    ld.param.u32    %r5, [serious_scramble_param_2];
+    setp.ge.s32     %p1, %r4, %r5;
+    @%p1 bra        $L__SCR_EXIT;
+
+    ld.param.u64    %rd1, [serious_scramble_param_0];
+    ld.param.u64    %rd2, [serious_scramble_param_1];
+
+    mul.wide.s32    %rd3, %r4, 4;
+    add.s64         %rd4, %rd1, %rd3;
+    ld.global.u32   %r6, [%rd4];
+
+    xor.b32         %r7, %r6, 0xCAFEBABE;
+    xor.b32         %r8, %r7, %r4;
+
+    add.s64         %rd5, %rd2, %rd3;
+    st.global.u32   [%rd5], %r8;
+
+$L__SCR_EXIT:
+    ret;
+}
+
+.visible .entry serious_fold(
+    .param .u64 serious_fold_param_0,
+    .param .u64 serious_fold_param_1,
+    .param .u32 serious_fold_param_2
+)
+{
+    .reg .pred      %p<2>;
+    .reg .b32       %r<10>;
+    .reg .b64       %rd<8>;
+
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mov.u32         %r3, %tid.x;
+    mad.lo.s32      %r4, %r1, %r2, %r3;
+
+    ld.param.u32    %r5, [serious_fold_param_2];
+    setp.ge.s32     %p1, %r4, %r5;
+    @%p1 bra        $L__FOLD_EXIT;
+
+    ld.param.u64    %rd1, [serious_fold_param_0];
+    ld.param.u64    %rd2, [serious_fold_param_1];
+
+    mul.wide.s32    %rd3, %r4, 4;
+    add.s64         %rd4, %rd1, %rd3;
+    ld.global.u32   %r6, [%rd4];
+
+    xor.b32         %r7, %r6, 0x12345678;
+    xor.b32         %r8, %r7, %r4;
+
+    add.s64         %rd5, %rd2, %rd3;
+    st.global.u32   [%rd5], %r8;
+
+$L__FOLD_EXIT:
+    ret;
+}
