@@ -256,7 +256,22 @@ Reportes HTML en `target/criterion/`.
 ./scripts/run_benchmarks.sh
 ./scripts/run_benchmarks.sh -- -n 50000 -t 8 -s 2048
 ./scripts/run_benchmarks.sh --runs 3 -- -n 20000 -t 24 -s 2048
+
+# Perfiles de ingesta / acelerador (resuelven cargo features automáticamente)
+./scripts/run_benchmarks.sh --profile network-async -- -n 10000 -t 24
+./scripts/run_benchmarks.sh --profile gpu-serious -- -n 5000 -t 8
+./scripts/run_benchmarks.sh --ingress io-uring --accelerator cuda-kernels -- -n 5000 -t 8
 ```
+
+Opciones del script (además de los flags del binario, tras `--`):
+
+| Flag | Descripción |
+|------|-------------|
+| `--profile NAME` | `baseline`, `network-async`, `network-io-uring`, `gpu-kernels`, `gpu-serious`, `network-gpu` |
+| `--ingress MODE` | `in-memory`, `async-tcp`, `io-uring` |
+| `--accelerator MODE` | `none`, `cuda-kernels`, `cuda-serious` |
+| `--no-build` | Omite `cargo build` (usa el binario ya compilado) |
+| `--runs N` | Repeticiones de `perf stat` por allocator |
 
 Genera una tabla comparativa con contadores de hardware:
 
@@ -266,20 +281,56 @@ Genera una tabla comparativa con contadores de hardware:
 
 Resultados en `target/perf-results/comparison_<timestamp>.txt`.
 
+### ¿Por qué compila en cada ejecución?
+
+`run_benchmarks.sh` **compila por defecto** (`DO_BUILD=1`) y ejecuta **tres builds release distintos** por corrida — uno por allocator (`use-system`, `use-jemalloc`, `use-mimalloc`). El allocator global se elige en tiempo de compilación (`#[global_allocator]`), no en runtime, y los tres escriben al mismo binario (`target/release/allocator-benchmarks`), así que cada medición requiere recompilar antes de ejecutar `perf stat`.
+
+Si añades flags de ingesta o GPU (`--profile gpu-serious`, `--ingress async-tcp`, etc.), Cargo genera **configuraciones de build adicionales** (p. ej. `use-jemalloc,gpu-serious`). Con el perfil release del proyecto (`lto = "fat"`, `codegen-units = 1`) cada combinación puede tardar varios segundos la primera vez.
+
+**Comportamiento esperado:**
+
+| Situación | Qué verás |
+|-----------|-----------|
+| Primera corrida completa (3 allocators) | 3× `Compiling` + `Finished` (~10 s cada uno con LTO) |
+| Segunda corrida con los mismos flags | Cargo suele responder `Finished` al instante (caché incremental) |
+| Cambias `--profile`, `--ingress` o `--accelerator` | Nueva combinación de features → recompilación |
+
+**Evitar compilar** (solo un allocator, sin comparativa de los tres):
+
+```bash
+cargo build --release --no-default-features --features use-jemalloc,gpu-serious
+./scripts/run_benchmarks.sh --no-build --accelerator cuda-serious
+```
+
+> `--no-build` ejecuta `perf stat` sobre el binario existente. No sirve para comparar los 3 allocators en una sola pasada, porque solo queda el último que compilaste manualmente.
+
 ### Campaña larga (recomendada para análisis serio)
 
 ```bash
 ./scripts/run_benchmarks_long.sh
-./scripts/run_benchmarks_long.sh --quick   # versión reducida (~5 min)
+./scripts/run_benchmarks_long.sh --quick      # versión reducida (~5 min)
+./scripts/run_benchmarks_long.sh --extended   # añade escenarios de red y GPU
 ```
 
-Ejecuta tres escenarios con 24 threads, 3 repeticiones por allocator y cooldown entre corridas:
+Ejecuta escenarios con `nproc` threads, 3 repeticiones por allocator y cooldown entre corridas.
 
-| Escenario | Formato | Payload | Iteraciones |
-|-----------|---------|---------|-------------|
-| A | JSON | 2 KiB | 10 M |
-| B | Borsh | 2 KiB | 10 M |
-| C | JSON | 8 KiB | 2 M |
+**Baseline** (comportamiento original):
+
+| Escenario | Formato | Payload | Iteraciones | Ingress | Accelerator |
+|-----------|---------|---------|-------------|---------|-------------|
+| A | JSON | 2 KiB | 10 M | in-memory | none |
+| B | Borsh | 2 KiB | 10 M | in-memory | none |
+| C | JSON | 8 KiB | 2 M | in-memory | none |
+
+**Con `--extended`** (omite escenarios GPU si no hay NVIDIA):
+
+| Escenario | Ingress | Accelerator |
+|-----------|---------|-------------|
+| D | async-tcp | none |
+| E | io-uring | none |
+| F | in-memory | cuda-kernels |
+| G | in-memory | cuda-serious |
+| H | async-tcp | cuda-kernels |
 
 Salida en `target/perf-results/long_<timestamp>/`.
 
@@ -287,8 +338,8 @@ Salida en `target/perf-results/long_<timestamp>/`.
 
 | Script | Descripción |
 |--------|-------------|
-| `scripts/run_benchmarks.sh` | Compara los 3 allocators bajo `perf stat` |
-| `scripts/run_benchmarks_long.sh` | Campaña multi-escenario con repetición estadística |
+| `scripts/run_benchmarks.sh` | Compara los 3 allocators bajo `perf stat`; soporta perfiles de ingesta/GPU |
+| `scripts/run_benchmarks_long.sh` | Campaña multi-escenario con repetición estadística; `--extended` para red/GPU |
 | `scripts/fix-perf-wrapper.sh` | Corrige el symlink de `perf` en Pop!_OS |
 
 ## Dependencias principales
